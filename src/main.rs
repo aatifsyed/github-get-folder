@@ -48,7 +48,15 @@ impl Client {
             data,
             errors,
             extensions: _,
-        } = resp?.into_json::<graphql_client::Response<T::ResponseData>>()?;
+        } = match resp {
+            Ok(it) => it.into_json::<graphql_client::Response<T::ResponseData>>()?,
+            Err(it @ ureq::Error::Transport(_)) => Err(it)?,
+            Err(ureq::Error::Status(_, resp)) => {
+                let msg = format!("{:?}", resp);
+                let body = resp.into_string().unwrap_or_default();
+                bail!("{}:\n{}", msg, body)
+            }
+        };
         if let Some(errors) = errors {
             bail!(
                 "{}",
@@ -163,6 +171,7 @@ fn main() -> anyhow::Result<()> {
             fs::write(local_path, text.context("binary blobs are not supported")?)?;
         }
         StartRepositoryObject::Tree(StartRepositoryObjectOnTree { entries }) => {
+            fs::create_dir_all(local_path.as_std_path())?;
             for StartRepositoryObjectOnTreeEntries { name, oid } in entries.into_iter().flatten() {
                 get(
                     &client,
