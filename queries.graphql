@@ -1,0 +1,33 @@
+query Start($repo_name: String!, $repo_owner: String!, $rev_parse: String!) {
+  repository(name: $repo_name, owner: $repo_owner) {
+    object(expression: $rev_parse) {
+      __typename # needed by codegen...
+      ... on Blob {
+        text
+      }
+      ... on Tree {
+        entries {
+          name
+          oid
+        }
+      }
+    }
+  }
+}
+
+query Cont($repo_name: String!, $repo_owner: String!, $oid: GitObjectID!) {
+  repository(name: $repo_name, owner: $repo_owner) {
+    object(oid: $oid) {
+      __typename # needed by codegen...
+      ... on Blob {
+        text
+      }
+      ... on Tree {
+        entries {
+          name
+          oid
+        }
+      }
+    }
+  }
+}
