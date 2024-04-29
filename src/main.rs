@@ -109,6 +109,7 @@ fn get(
 struct Args {
     owner: String,
     name: String,
+    #[arg(default_value = "HEAD")]
     commit_ish: String,
     #[arg(default_value = "/")]
     remote_path: Utf8PathBuf,
