@@ -1,5 +1,3 @@
-use std::{borrow::Cow, fs};
-
 use self::{
     cont::{
         ContRepositoryObject, ContRepositoryObjectOnBlob, ContRepositoryObjectOnTree,
@@ -13,8 +11,11 @@ use self::{
 use anyhow::{bail, Context as _};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
+use futures::{stream, StreamExt as _, TryStreamExt as _};
 use graphql_client::GraphQLQuery;
+use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct GitObjectID(String);
@@ -35,46 +36,46 @@ pub struct Start;
 )]
 pub struct Cont;
 
+pub struct Client {
+    inner: reqwest::Client,
+    url: String,
+    token: Option<String>,
+}
+
 impl Client {
-    pub fn call<T: GraphQLQuery>(&self, params: T::Variables) -> anyhow::Result<T::ResponseData> {
-        let query = T::build_query(params);
-        let ureq = ureq::post(&self.endpoint);
-        let resp = match self.token.as_deref() {
-            Some(it) => ureq.set("Authorization", &format!("Bearer {}", it)),
-            None => ureq,
+    async fn call<T: GraphQLQuery>(&self, params: T::Variables) -> anyhow::Result<T::ResponseData> {
+        let builder = self.inner.post(&self.url).json(&T::build_query(params));
+        let response = match &self.token {
+            Some(it) => builder.bearer_auth(it),
+            None => builder,
         }
-        .send_json(query);
+        .send()
+        .await?;
+
         let graphql_client::Response {
             data,
             errors,
             extensions: _,
-        } = match resp {
-            Ok(it) => it.into_json::<graphql_client::Response<T::ResponseData>>()?,
-            Err(it @ ureq::Error::Transport(_)) => Err(it)?,
-            Err(ureq::Error::Status(_, resp)) => {
-                let msg = format!("{:?}", resp);
-                let body = resp.into_string().unwrap_or_default();
-                bail!("{}:\n{}", msg, body)
+        } = match response.error_for_status_ref() {
+            Ok(_) => response.json().await?,
+            Err(e) => {
+                bail!("{}\n\n{}", e, response.text().await?)
             }
         };
-        if let Some(errors) = errors {
-            bail!(
-                "{}",
-                errors
-                    .iter()
-                    .map(|it| it.to_string())
-                    .fold(String::new(), |acc, el| acc + &el + "\n")
-            )
+
+        if errors.as_ref().is_some_and(|it| !it.is_empty()) {
+            bail!("query errors: {}", errors.into_iter().flatten().join(", "))
         }
-        data.context("no response")
+
+        data.context("query response has no `data` member")
     }
 }
 
-fn get(
+async fn get(
     client: &Client,
     repo_name: &str,
     repo_owner: &str,
-    local_path: Cow<Utf8Path>,
+    local_path: Cow<'_, Utf8Path>,
     oid: GitObjectID,
 ) -> anyhow::Result<()> {
     match client
@@ -82,30 +83,41 @@ fn get(
             repo_name: repo_name.into(),
             repo_owner: repo_owner.into(),
             oid,
-        })?
+        })
+        .await?
         .repository
         .and_then(|it| it.object)
         .context("incomplete response")?
     {
         ContRepositoryObject::Blob(ContRepositoryObjectOnBlob { text }) => {
             println!("blob {}", local_path);
-            fs::write(
+            tokio::fs::write(
                 local_path.as_std_path(),
                 text.context("binary blobs are not supported")?,
-            )?;
+            )
+            .await?;
         }
         ContRepositoryObject::Tree(ContRepositoryObjectOnTree { entries }) => {
             println!("tree {}", local_path);
-            fs::create_dir_all(local_path.as_std_path())?;
-            for ContRepositoryObjectOnTreeEntries { name, oid } in entries.into_iter().flatten() {
-                get(
-                    client,
-                    repo_name,
-                    repo_owner,
-                    local_path.join(name).into(),
-                    oid,
-                )?
-            }
+            tokio::fs::create_dir_all(local_path.as_std_path()).await?;
+            let concurrency = entries
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or_default()
+                .saturating_add(1);
+            stream::iter(entries.into_iter().flatten())
+                .map(|ContRepositoryObjectOnTreeEntries { name, oid }| {
+                    get(
+                        client,
+                        repo_name,
+                        repo_owner,
+                        local_path.join(name).into(),
+                        oid,
+                    )
+                })
+                .buffer_unordered(concurrency)
+                .try_collect::<()>()
+                .await?;
         }
         ContRepositoryObject::Commit => bail!("unexpected `commit` object"),
         ContRepositoryObject::Tag => bail!("unexpected `tag` object"),
@@ -129,13 +141,17 @@ struct Args {
     token: Option<String>,
 }
 
-#[derive(Debug)]
-pub struct Client {
-    endpoint: String,
-    token: Option<String>,
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(_main())
 }
 
-fn main() -> anyhow::Result<()> {
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+async fn _main() -> anyhow::Result<()> {
     let Args {
         owner: repo_owner,
         name: repo_name,
@@ -145,7 +161,11 @@ fn main() -> anyhow::Result<()> {
         endpoint,
         token,
     } = Args::parse();
-    let client = Client { endpoint, token };
+    let client = Client {
+        inner: reqwest::Client::builder().user_agent(USER_AGENT).build()?,
+        url: endpoint,
+        token,
+    };
     let remote_path = match remote_path.is_absolute() {
         true => remote_path
             .components()
@@ -163,24 +183,34 @@ fn main() -> anyhow::Result<()> {
             repo_owner: repo_owner.clone(),
             repo_name: repo_name.clone(),
             rev_parse: format!("{}:{}", commit_ish, remote_path),
-        })?
+        })
+        .await?
         .repository
-        .context("no repository")?;
-    match start.object.context("no object")? {
+        .context("no `repository` member")?;
+    match start.object.context("no `object` member")? {
         StartRepositoryObject::Blob(StartRepositoryObjectOnBlob { text }) => {
-            fs::write(local_path, text.context("binary blobs are not supported")?)?;
+            tokio::fs::write(local_path, text.context("binary blobs are not supported")?).await?;
         }
         StartRepositoryObject::Tree(StartRepositoryObjectOnTree { entries }) => {
-            fs::create_dir_all(local_path.as_std_path())?;
-            for StartRepositoryObjectOnTreeEntries { name, oid } in entries.into_iter().flatten() {
-                get(
-                    &client,
-                    &repo_name,
-                    &repo_owner,
-                    local_path.join(name).into(),
-                    oid,
-                )?;
-            }
+            tokio::fs::create_dir_all(local_path.as_std_path()).await?;
+            let concurrency = entries
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or_default()
+                .saturating_add(1);
+            stream::iter(entries.into_iter().flatten())
+                .map(|StartRepositoryObjectOnTreeEntries { name, oid }| {
+                    get(
+                        &client,
+                        &repo_name,
+                        &repo_owner,
+                        local_path.join(name).into(),
+                        oid,
+                    )
+                })
+                .buffer_unordered(concurrency)
+                .try_collect::<()>()
+                .await?;
         }
         StartRepositoryObject::Commit => bail!("unexpected `commit` object"),
         StartRepositoryObject::Tag => bail!("unexpected `tag` object"),
