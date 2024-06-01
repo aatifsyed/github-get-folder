@@ -43,7 +43,10 @@ pub struct Client {
 }
 
 impl Client {
-    async fn call<T: GraphQLQuery>(&self, params: T::Variables) -> anyhow::Result<T::ResponseData> {
+    async fn query<T: GraphQLQuery>(
+        &self,
+        params: T::Variables,
+    ) -> anyhow::Result<T::ResponseData> {
         let builder = self.inner.post(&self.url).json(&T::build_query(params));
         let response = match &self.token {
             Some(it) => builder.bearer_auth(it),
@@ -79,7 +82,7 @@ async fn get(
     oid: GitObjectID,
 ) -> anyhow::Result<()> {
     match client
-        .call::<Cont>(cont::Variables {
+        .query::<Cont>(cont::Variables {
             repo_name: repo_name.into(),
             repo_owner: repo_owner.into(),
             oid,
@@ -99,30 +102,47 @@ async fn get(
         }
         ContRepositoryObject::Tree(ContRepositoryObjectOnTree { entries }) => {
             println!("tree {}", local_path);
-            tokio::fs::create_dir_all(local_path.as_std_path()).await?;
-            let concurrency = entries
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or_default()
-                .saturating_add(1);
-            stream::iter(entries.into_iter().flatten())
-                .map(|ContRepositoryObjectOnTreeEntries { name, oid }| {
-                    get(
-                        client,
-                        repo_name,
-                        repo_owner,
-                        local_path.join(name).into(),
-                        oid,
-                    )
-                })
-                .buffer_unordered(concurrency)
-                .try_collect::<()>()
-                .await?;
+            tree(
+                local_path,
+                entries
+                    .into_iter()
+                    .flatten()
+                    .map(|ContRepositoryObjectOnTreeEntries { name, oid }| (name, oid)),
+                client,
+                repo_name,
+                repo_owner,
+            )
+            .await?;
         }
         ContRepositoryObject::Commit => bail!("unexpected `commit` object"),
         ContRepositoryObject::Tag => bail!("unexpected `tag` object"),
     }
     Ok(())
+}
+
+async fn tree(
+    local_path: Cow<'_, Utf8Path>,
+    entries: impl IntoIterator<Item = (String, GitObjectID)>,
+    client: &Client,
+    repo_name: &str,
+    repo_owner: &str,
+) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(local_path.as_std_path()).await?;
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let concurrency = entries.len().saturating_add(1);
+    stream::iter(entries)
+        .map(|(name, oid)| {
+            get(
+                client,
+                repo_name,
+                repo_owner,
+                local_path.join(name).into(),
+                oid,
+            )
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<()>()
+        .await
 }
 
 #[derive(Parser)]
@@ -179,7 +199,7 @@ async fn _main() -> anyhow::Result<()> {
     };
 
     let start = client
-        .call::<Start>(start::Variables {
+        .query::<Start>(start::Variables {
             repo_owner: repo_owner.clone(),
             repo_name: repo_name.clone(),
             rev_parse: format!("{}:{}", commit_ish, remote_path),
@@ -192,25 +212,17 @@ async fn _main() -> anyhow::Result<()> {
             tokio::fs::write(local_path, text.context("binary blobs are not supported")?).await?;
         }
         StartRepositoryObject::Tree(StartRepositoryObjectOnTree { entries }) => {
-            tokio::fs::create_dir_all(local_path.as_std_path()).await?;
-            let concurrency = entries
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or_default()
-                .saturating_add(1);
-            stream::iter(entries.into_iter().flatten())
-                .map(|StartRepositoryObjectOnTreeEntries { name, oid }| {
-                    get(
-                        &client,
-                        &repo_name,
-                        &repo_owner,
-                        local_path.join(name).into(),
-                        oid,
-                    )
-                })
-                .buffer_unordered(concurrency)
-                .try_collect::<()>()
-                .await?;
+            tree(
+                local_path.into(),
+                entries
+                    .into_iter()
+                    .flatten()
+                    .map(|StartRepositoryObjectOnTreeEntries { name, oid }| (name, oid)),
+                &client,
+                &repo_name,
+                &repo_owner,
+            )
+            .await?;
         }
         StartRepositoryObject::Commit => bail!("unexpected `commit` object"),
         StartRepositoryObject::Tag => bail!("unexpected `tag` object"),
