@@ -147,17 +147,25 @@ async fn tree(
 
 #[derive(Parser)]
 struct Args {
+    /// The `rust-lang` in `https://github.com/rust-lang/rust`.
     owner: String,
+    /// The `rust` in `https://github.com/rust-lang/rust`.
     name: String,
-    #[arg(default_value = "HEAD")]
-    commit_ish: String,
-    #[arg(default_value = "/")]
-    remote_path: Utf8PathBuf,
-    #[arg(default_value = ".")]
-    local_path: Utf8PathBuf,
+    #[arg(long, short, default_value = "HEAD")]
+    rev: String,
+    #[arg(long, short = 'p', default_value = "/", value_name = "REMOTE_PATH")]
+    remote: Utf8PathBuf,
+    #[arg(long, short, default_value = ".", value_name = "LOCAL_PATH")]
+    local: Utf8PathBuf,
     #[arg(long, default_value = "https://api.github.com/graphql")]
     endpoint: String,
-    #[arg(long, env("GITHUB_TOKEN"))]
+    #[arg(
+        long,
+        short,
+        env = "GITHUB_TOKEN",
+        value_name = "GITHUB_TOKEN",
+        hide_env_values = true
+    )]
     token: Option<String>,
 }
 
@@ -175,9 +183,9 @@ async fn _main() -> anyhow::Result<()> {
     let Args {
         owner: repo_owner,
         name: repo_name,
-        commit_ish,
-        remote_path,
-        local_path,
+        rev: commit_ish,
+        remote: remote_path,
+        local: local_path,
         endpoint,
         token,
     } = Args::parse();
